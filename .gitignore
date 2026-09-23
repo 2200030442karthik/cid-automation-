@@ -1,0 +1,13 @@
+# Sensitive - Simplex login session / cookies. Never commit this.
+simplex_session.json
+
+# Sensitive - full Chrome profile (saved passwords, cookies, local storage).
+playwright_profile/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS junk
+Thumbs.db
+desktop.ini
