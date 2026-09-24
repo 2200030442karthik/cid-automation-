@@ -520,10 +520,22 @@ def parse_batch_excel(file_path):
                 + f"\nFile: {file_path}"
             )
 
+        toc_path = Path(toc_path_text)
+
+        # A relative path that doesn't exist from the current folder is
+        # looked up next to the batch file instead. Paths that already
+        # work are left exactly as they are.
+        if not toc_path.is_absolute() and not toc_path.exists():
+
+            beside_batch = file_path.parent / toc_path
+
+            if beside_batch.exists():
+                toc_path = beside_batch
+
         batch_rows.append({
             "row_number": row_number,
             "title_hint": title_hint,
-            "toc_path": Path(toc_path_text),
+            "toc_path": toc_path,
             "primary_category": primary_category,
             "primary_eid": primary_eid,
             "course_level": course_level,
@@ -667,6 +679,10 @@ def call_ollama_chat(messages):
         "stream": False,
         "options": {
             "temperature": 0.3,
+            # Ollama's default context window is small and it silently
+            # drops whatever doesn't fit - large TOCs plus retry
+            # feedback need room so the whole TOC is actually read.
+            "num_ctx": 8192,
         },
     }
 
@@ -1781,8 +1797,10 @@ def fill_basic_page(
         "\nSelecting Course Level..."
     )
 
+    # Attribute selector, because "#level-Tool Based" (with a space)
+    # is not a valid CSS id selector.
     level_radio = page.locator(
-        f"#level-{simplex_level}"
+        f'[id="level-{simplex_level}"]'
     )
 
     if level_radio.count() == 0:
@@ -2263,13 +2281,13 @@ def find_input_near_text(
 
             surrounding_text = current.evaluate(
                 """
-                el => {
+                (el, labelText) => {
                     let node = el;
 
                     for (let i = 0; i < 4 && node; i++) {
                         if (node.innerText &&
                             node.innerText.toLowerCase().includes(
-                                arguments[0].toLowerCase()
+                                labelText.toLowerCase()
                             )) {
                             return node.innerText;
                         }
@@ -2424,6 +2442,11 @@ def open_existing_course_from_listing(
 
     matching_row = None
 
+    # Prefer a row where one cell is exactly the course name, so
+    # "Excel Fundamentals" never opens "Advanced Excel Fundamentals".
+    exact_rows = []
+    partial_rows = []
+
     for i in range(rows.count()):
 
         row = rows.nth(i)
@@ -2431,28 +2454,49 @@ def open_existing_course_from_listing(
         try:
 
             row_text = row.inner_text()
+            cell_texts = row.locator("td").all_inner_texts()
 
         except Exception:
 
             continue
 
-        row_normalized = (
-            normalize_course_name_for_match(
-                row_text
-            )
+        if any(
+            normalize_course_name_for_match(cell) == target_normalized
+            for cell in cell_texts
+        ):
+
+            exact_rows.append(row)
+
+        elif target_normalized in normalize_course_name_for_match(
+            row_text
+        ):
+
+            partial_rows.append(row)
+
+    if exact_rows:
+
+        matching_row = exact_rows[0]
+
+        print(
+            "Matching course row found (exact name match)."
         )
 
-        # We specifically compare the requested
-        # normalized course name against the row.
-        if target_normalized in row_normalized:
+    elif len(partial_rows) == 1:
 
-            matching_row = row
+        matching_row = partial_rows[0]
 
-            print(
-                "Matching course row found."
-            )
+        print(
+            "Matching course row found."
+        )
 
-            break
+    elif len(partial_rows) > 1:
+
+        raise Exception(
+            "Multiple courses in Course Listing contain this name, "
+            "and none matches it exactly - refusing to guess which "
+            "one to edit.\n\n"
+            f"Course searched:\n{course_title}"
+        )
 
     if matching_row is None:
 
@@ -3135,8 +3179,6 @@ SKIP_PAGE_PATHS = [
     "/admin/course/program-colletrals/courseId/{}",
 ]
 
-DUMMY_SKILLUP_IMAGE = DUMMY_COURSE_LOGO
-
 
 def navigate_and_leave_intermediate_pages(page, course_id):
 
@@ -3294,170 +3336,6 @@ def find_input_near_text_generic(page, text_value, tag_names=("input", "textarea
                     return controls.first
 
     return None
-
-
-def check_checkbox_by_text(page, text_value):
-
-    # Prefer an associated label.
-    labels = page.locator("label").filter(
-        has_text=text_value
-    )
-
-    for i in range(labels.count()):
-        label = labels.nth(i)
-        target_id = label.get_attribute("for")
-
-        if target_id:
-            checkbox = page.locator("#" + target_id)
-            if checkbox.count() > 0:
-                if not checkbox.is_checked():
-                    checkbox.check()
-                return checkbox
-
-        checkbox = label.locator("input[type='checkbox']")
-        if checkbox.count() > 0:
-            if not checkbox.is_checked():
-                checkbox.check()
-            return checkbox
-
-    # Fallback: search nearby containers.
-    text_locator = page.get_by_text(
-        text_value,
-        exact=False
-    )
-
-    for i in range(min(text_locator.count(), 10)):
-
-        current = text_locator.nth(i)
-
-        for levels in range(1, 6):
-            container = current.locator("xpath=" + "/.." * levels)
-            if container.count() == 0:
-                continue
-
-            checkbox = container.locator(
-                "input[type='checkbox']"
-            )
-
-            if checkbox.count() == 1:
-                if not checkbox.is_checked():
-                    checkbox.check()
-                return checkbox
-
-    raise Exception(
-        f"Could not find checkbox for: {text_value}"
-    )
-
-
-def select_radio_by_text(page, text_value):
-
-    labels = page.locator("label").filter(
-        has_text=text_value
-    )
-
-    for i in range(labels.count()):
-        label = labels.nth(i)
-        target_id = label.get_attribute("for")
-
-        if target_id:
-            radio = page.locator("#" + target_id)
-            if radio.count() > 0:
-                radio.check()
-                return radio
-
-        radio = label.locator("input[type='radio']")
-        if radio.count() > 0:
-            radio.check()
-            return radio
-
-    text_locator = page.get_by_text(
-        text_value,
-        exact=False
-    )
-
-    for i in range(min(text_locator.count(), 10)):
-        current = text_locator.nth(i)
-
-        for levels in range(1, 6):
-            container = current.locator("xpath=" + "/.." * levels)
-            if container.count() == 0:
-                continue
-
-            radio = container.locator("input[type='radio']")
-            if radio.count() == 1:
-                radio.check()
-                return radio
-
-    raise Exception(
-        f"Could not find radio option: {text_value}"
-    )
-
-
-def select_radio_by_text_occurrence(page, text_value, occurrence=0):
-
-    labels = page.locator("label").filter(
-        has_text=text_value
-    )
-
-    matching_radios = []
-
-    for i in range(labels.count()):
-        label = labels.nth(i)
-        target_id = label.get_attribute("for")
-
-        if target_id:
-            radio = page.locator("#" + target_id)
-            if radio.count() > 0 and radio.get_attribute("type") == "radio":
-                matching_radios.append(radio.first)
-                continue
-
-        radio = label.locator("input[type='radio']")
-        if radio.count() > 0:
-            matching_radios.append(radio.first)
-
-    if not matching_radios:
-        raise Exception(
-            f"Could not find radio option: {text_value}"
-        )
-
-    if occurrence < 0:
-        index = len(matching_radios) + occurrence
-    else:
-        index = occurrence
-
-    if index < 0 or index >= len(matching_radios):
-        raise Exception(
-            f"Radio option occurrence {occurrence} was not found for: "
-            f"{text_value}. Found {len(matching_radios)} matching option(s)."
-        )
-
-    radio = matching_radios[index]
-    radio.check()
-    return radio
-
-
-def find_image_inputs(page):
-
-    # Find text/url fields associated with the two Program Thumbnail labels.
-    results = []
-
-    for label_text in [
-        "Program Card Thumbnail Image",
-        "Program Page Thumbnail Image",
-    ]:
-
-        control = find_input_near_text_generic(
-            page,
-            label_text,
-            tag_names=("input", "textarea")
-        )
-
-        if control is None:
-            results.append(None)
-        else:
-            results.append(control)
-
-    return results
 
 
 def find_section_container_by_heading(page, heading_text, required_selector=None):
@@ -4426,6 +4304,28 @@ def run_single_cid(
                 "Fix the batch row's Course Title, or point it at the "
                 "correct TOC file."
             )
+
+    # --------------------------------------------------------
+    # VALIDATE INPUTS BEFORE TOUCHING OLLAMA OR SIMPLEX
+    # --------------------------------------------------------
+
+    # These are the same checks the later steps perform; running them
+    # here means a bad level/duration stops the course before anything
+    # is written to Simplex, instead of after SEO/Basic/Overview/Skills.
+    normalize_course_level(course_level_input)
+    parse_duration(duration_input)
+    calculate_skillup_hours(duration_input)
+
+    if course_level_input.strip().lower() not in (
+        "beginner", "intermediate", "advanced"
+    ):
+
+        raise Exception(
+            "B2B SkillUp LMS course level must be Beginner, "
+            "Intermediate, or Advanced.\n"
+            f"Received: {course_level_input}\n\n"
+            "Nothing was written to Simplex for this course."
+        )
 
     skills, course_overview = generate_skills_and_overview_via_ollama(
         toc_data
