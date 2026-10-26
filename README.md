@@ -34,6 +34,22 @@ ollama pull llama3.2:3b
 Ollama runs as a background service after install (listens on
 `http://localhost:11434`). No API key, no cost.
 
+### Optional: OpenAI fallback
+
+If local Ollama cannot produce a valid Skills/Overview result for a
+course, the script can retry that one course on OpenAI
+(`gpt-4.1-mini`, at most 3 calls per course and at most 3 courses per
+run). It is used only when Ollama fails,
+and only if an API key is set as an environment variable - never put
+the key in the code:
+
+```powershell
+setx OPENAI_API_KEY "sk-..."
+```
+
+Open a new terminal afterwards so the variable is picked up. Without
+the key, the script behaves exactly as before (Ollama only).
+
 ## Before every run
 
 Chrome must be launched with remote debugging enabled, and you must be
@@ -65,6 +81,26 @@ You'll be asked to choose:
   Excel file). A course row failing does not stop the batch - it's
   reported in the summary at the end, and processing continues with
   the next row.
+
+## Other tools
+
+All of these use the same logged-in Chrome session as `main.py`.
+`logo_update.py` and `sunsettled.py` ask for **1. Single CID** or
+**2. Bunch of CIDs** (CIDs separated by comma or space), and one CID
+failing does not stop the rest.
+
+- **`python logo_update.py`** - adds the `541 - Simplilearn_New` logo to
+  existing CIDs: Basic page (Accreditation Heading + Accreditation
+  Logos, max 2 allowed) and B2B SkillUp (Accreditation Configuration =
+  Edit for SLH + Logos). Ticks "I have reviewed and validated the
+  skills listed." if it is unticked. Both pages are reloaded to verify
+  the save.
+- **`python sunsettled.py`** - unlives CIDs: sets B2B SkillUp > Course
+  Basics > Part of other product offering to **None** and submits.
+  Nothing else is changed. Asks you to type `YES` before changing
+  anything.
+- **`python check_cid.py 8071 8072`** - read-only check of CIDs created
+  by `main.py`; reports PASS/FAIL for each saved value. Never saves.
 
 ## Notes
 

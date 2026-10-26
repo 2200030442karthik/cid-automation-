@@ -1,3 +1,4 @@
+import os
 import re
 import json
 import math
@@ -35,10 +36,28 @@ CERTIFICATE_FILE = Path(__file__).parent / "unname.jpg"
 
 LEARNING_RATING = "4.5"
 
+# Accreditation logo set on the Basic page (Accreditation Heading +
+# Accreditation Logos) and on B2B SkillUp (Accreditation Configuration).
+SIMPLILEARN_NEW_LOGO_ID = "541"
+SIMPLILEARN_NEW_LOGO_NAME = "Simplilearn_New"
+
 OLLAMA_CHAT_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "llama3.2:3b"
 OLLAMA_TIMEOUT_SECONDS = 180
 MAX_OLLAMA_ATTEMPTS = 8
+
+# Paid fallback, used ONLY when local Ollama cannot produce a valid
+# Skills/Overview result. The key is read from the OPENAI_API_KEY
+# environment variable - never put it in this file.
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_MODEL = "gpt-4.1-mini"
+OPENAI_TIMEOUT_SECONDS = 90
+MAX_OPENAI_ATTEMPTS = 3
+
+# The key is shared, so keep usage minimal: at most this many courses
+# per run (a batch counts as one run) may fall back to OpenAI.
+MAX_OPENAI_FALLBACK_COURSES_PER_RUN = 3
+openai_fallback_courses_used = 0
 
 SKILLS_OVERVIEW_SYSTEM_PROMPT = """You are analysing a complete course Table of Contents.
 
@@ -88,9 +107,18 @@ COURSE OVERVIEW RULES
    "expert-level", "master", "cutting-edge", "seamless", or "unlock"
    unless that exact claim is directly supported by a TOC entry.
 6. Produce one concise paragraph.
-7. The overview must be between 250 and 350 characters, counting
+7. The overview must be between 300 and 350 characters, counting
    spaces and punctuation. This is a hard platform constraint -
    count your characters before answering.
+8. Write in a professional catalogue voice. Never refer to the
+   course itself: do not use phrases such as "This course",
+   "In this course", "The course", "This program", "This
+   masterclass", "equips learners", "teaches",
+   "You will learn", "Learners will", "Participants will" or
+   "Designed to". Open directly with the subject matter or an
+   action verb such as "Learn to", "Build", "Develop" or "Apply".
+   Every topic, tool and technique you mention must come from
+   THIS course's TOC.
 
 OUTPUT FORMAT
 
@@ -597,6 +625,11 @@ STOPWORDS = {
 
 MINOR_TOPIC_DURATION_SHARE = 0.06
 
+# A topic is only "minor" when it is also clearly shorter than a typical
+# topic in the same course. Without this, a course split into many
+# equal ~4% topics would make every topic minor and no skill could pass.
+MINOR_TOPIC_AVERAGE_RATIO = 0.6
+
 
 def significant_words(text):
 
@@ -634,13 +667,37 @@ def find_minor_topic_skills(cleaned_skills, toc_data):
     if total_duration <= 0:
         return []
 
+    minor_share_limit = min(
+        MINOR_TOPIC_DURATION_SHARE,
+        MINOR_TOPIC_AVERAGE_RATIO / len(all_topics)
+    )
+
+    # Words from the course name (e.g. "strategic" in "Strategic
+    # Thinking for Leaders") run through the whole course, so they
+    # can't tie a skill to any one topic - ignore them when matching.
+    course_theme_words = significant_words(toc_data["course_name"])
+
     flagged = []
 
     for skill in cleaned_skills:
 
-        skill_words = significant_words(skill)
+        skill_words = significant_words(skill) - course_theme_words
 
         if not skill_words:
+            continue
+
+        # A skill matching a whole lesson (2+ topics) is backed by
+        # that lesson, not by a single minor topic.
+        lesson_backed = any(
+            len(lesson["topics"]) >= 2
+            and lesson["lesson_name"]
+            and len(
+                skill_words & significant_words(lesson["lesson_name"])
+            ) / len(skill_words) >= 0.5
+            for lesson in toc_data["lessons"]
+        )
+
+        if lesson_backed:
             continue
 
         contributing_topics = [
@@ -659,7 +716,7 @@ def find_minor_topic_skills(cleaned_skills, toc_data):
         topic = contributing_topics[0]
         share = topic["duration_seconds"] / total_duration
 
-        if share < MINOR_TOPIC_DURATION_SHARE:
+        if share < minor_share_limit:
 
             flagged.append({
                 "skill": skill,
@@ -726,6 +783,84 @@ def call_ollama_chat(messages):
             f"Raw response:\n{content}\n\n"
             f"Original error: {error}"
         )
+
+
+def call_openai_chat(messages):
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+
+    if not api_key:
+        raise Exception(
+            "OPENAI_API_KEY is not set, so the OpenAI fallback "
+            "cannot be used."
+        )
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+    }
+
+    request = urllib.request.Request(
+        OPENAI_CHAT_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            request,
+            timeout=OPENAI_TIMEOUT_SECONDS
+        ) as response:
+
+            body = json.loads(response.read().decode("utf-8"))
+
+    except urllib.error.HTTPError as error:
+
+        detail = error.read().decode("utf-8", errors="replace")[:500]
+
+        raise Exception(
+            f"OpenAI API returned HTTP {error.code}.\n{detail}"
+        )
+
+    except (urllib.error.URLError, TimeoutError) as error:
+
+        raise Exception(
+            f"Could not reach the OpenAI API.\n\nOriginal error: {error}"
+        )
+
+    content = body["choices"][0]["message"]["content"]
+
+    try:
+        return json.loads(content)
+
+    except json.JSONDecodeError as error:
+
+        raise Exception(
+            "OpenAI did not return valid JSON for the Skills/Overview "
+            "request.\n\n"
+            f"Raw response:\n{content}\n\n"
+            f"Original error: {error}"
+        )
+
+
+# Self-referential phrasing ("This course teaches...") reads as
+# unprofessional in the catalogue - the overview must describe the
+# subject directly.
+OVERVIEW_BANNED_PATTERNS = [
+    r"\b(?:this|the|our|in this) (?:course|program|programme|training|module|class|masterclass|workshop|session|bootcamp)\b",
+    r"\bequips (?:learners|participants|students|you)\b",
+    r"\bteach(?:es|ing)?\b",
+    r"\byou will (?:learn|gain|be able)\b",
+    r"\b(?:learners?|participants?|students?) will\b",
+    r"\bdesigned to\b",
+]
 
 
 def validate_ollama_result(result, toc_data):
@@ -829,16 +964,16 @@ def validate_ollama_result(result, toc_data):
 
         length = len(overview.strip())
 
-        if not 250 <= length <= 350:
+        if not 300 <= length <= 350:
 
-            target = 300
+            target = 325
 
-            if length < 250:
+            if length < 300:
 
                 problems.append(
                     f"The overview is {length} characters, which is "
-                    f"{250 - length} characters too short (target "
-                    f"range 250-350, aim for about {target}). Add one "
+                    f"{300 - length} characters too short (target "
+                    f"range 300-350, aim for about {target}). Add one "
                     "more specific, real detail pulled from the TOC "
                     "(e.g. name a specific topic or technique not yet "
                     "mentioned) - do not add generic filler sentences."
@@ -849,14 +984,91 @@ def validate_ollama_result(result, toc_data):
                 problems.append(
                     f"The overview is {length} characters, which is "
                     f"{length - 350} characters too long (target range "
-                    f"250-350, aim for about {target}). Remove some "
+                    f"300-350, aim for about {target}). Remove some "
                     "detail while keeping it accurate to the TOC."
                 )
+
+        self_references = sorted({
+            match.group(0)
+            for pattern in OVERVIEW_BANNED_PATTERNS
+            for match in re.finditer(pattern, overview, re.IGNORECASE)
+        })
+
+        if self_references:
+
+            problems.append(
+                "The overview refers to the course itself instead of "
+                f"describing the subject: {self_references}. Remove "
+                "these phrases and open directly with the subject "
+                "matter or an action verb (e.g. 'Build...', "
+                "'Develop...', 'Apply...')."
+            )
 
     return problems
 
 
 def generate_skills_and_overview_via_ollama(toc_data):
+    """
+    Generate Skills Covered + Course Overview from the TOC.
+
+    Local Ollama is always tried first (free). Only if it cannot pass
+    validation within MAX_OLLAMA_ATTEMPTS, and OPENAI_API_KEY is set,
+    the same prompt and validation are retried on OpenAI as a paid
+    fallback (at most MAX_OPENAI_ATTEMPTS calls).
+    """
+
+    try:
+
+        return run_generation_attempts(
+            toc_data,
+            call_ollama_chat,
+            f"Ollama ({OLLAMA_MODEL})",
+            MAX_OLLAMA_ATTEMPTS
+        )
+
+    except Exception as ollama_error:
+
+        global openai_fallback_courses_used
+
+        if not os.environ.get("OPENAI_API_KEY", "").strip():
+            raise
+
+        if openai_fallback_courses_used >= MAX_OPENAI_FALLBACK_COURSES_PER_RUN:
+            raise Exception(
+                f"{ollama_error}\n\n"
+                "OpenAI fallback was not used: the limit of "
+                f"{MAX_OPENAI_FALLBACK_COURSES_PER_RUN} fallback "
+                "course(s) per run has been reached."
+            )
+
+        openai_fallback_courses_used += 1
+
+        print(
+            "\nLocal Ollama could not produce a valid result - "
+            f"falling back to OpenAI ({OPENAI_MODEL}) "
+            f"[fallback course {openai_fallback_courses_used}/"
+            f"{MAX_OPENAI_FALLBACK_COURSES_PER_RUN} this run]."
+        )
+
+        try:
+
+            return run_generation_attempts(
+                toc_data,
+                call_openai_chat,
+                f"OpenAI ({OPENAI_MODEL})",
+                MAX_OPENAI_ATTEMPTS
+            )
+
+        except Exception as openai_error:
+
+            raise Exception(
+                f"{ollama_error}\n\n"
+                "OpenAI fallback also failed:\n"
+                f"{openai_error}"
+            )
+
+
+def run_generation_attempts(toc_data, call_model, model_label, max_attempts):
 
     toc_text = format_toc_for_prompt(toc_data)
 
@@ -867,14 +1079,14 @@ def generate_skills_and_overview_via_ollama(toc_data):
 
     last_problems = []
 
-    for attempt in range(1, MAX_OLLAMA_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
 
         print(
-            f"\nAsking Ollama ({OLLAMA_MODEL}) to analyse the TOC... "
-            f"attempt {attempt}/{MAX_OLLAMA_ATTEMPTS}"
+            f"\nAsking {model_label} to analyse the TOC... "
+            f"attempt {attempt}/{max_attempts}"
         )
 
-        result = call_ollama_chat(messages)
+        result = call_model(messages)
 
         problems = validate_ollama_result(result, toc_data)
 
@@ -887,7 +1099,7 @@ def generate_skills_and_overview_via_ollama(toc_data):
 
         last_problems = problems
 
-        print("Ollama output did not pass validation:")
+        print(f"{model_label} output did not pass validation:")
 
         for problem in problems:
             print(" -", problem)
@@ -910,8 +1122,8 @@ def generate_skills_and_overview_via_ollama(toc_data):
         })
 
     raise Exception(
-        "Ollama could not produce a valid Skills/Overview result "
-        f"after {MAX_OLLAMA_ATTEMPTS} attempts.\n\n"
+        f"{model_label} could not produce a valid Skills/Overview "
+        f"result after {max_attempts} attempts.\n\n"
         "Last problems:\n"
         + "\n".join(f"- {problem}" for problem in last_problems)
     )
@@ -1190,6 +1402,27 @@ def select_option_containing(
             f"'{desired_text}' after normalization."
         )
 
+    # Same words, different spacing: 'Cybersecurity' in the input
+    # file vs '3 - Cyber Security' in Simplex.
+    desired_compact = desired_normalized.replace(" ", "")
+
+    compact_matches = [
+        item for item in matches
+        if item["normalized"].replace(" ", "") == desired_compact
+    ]
+
+    if len(compact_matches) == 1:
+        selected = compact_matches[0]
+        select.select_option(value=selected["value"])
+        return selected["text"]
+
+    if len(compact_matches) > 1:
+        examples = ", ".join(item["text"] for item in compact_matches)
+        raise Exception(
+            f"Category '{desired_text}' matches more than one Simplex "
+            f"category when spaces are ignored: {examples}"
+        )
+
     # Safe fallback for a unique partial match.
     partial_matches = [
         item for item in matches
@@ -1216,9 +1449,71 @@ def select_option_containing(
 
     raise Exception(
         f"Could not find '{desired_text}' inside select '{selector}'. "
-        "Matching ignores case, extra spaces, punctuation, "
+        "Matching ignores case, spaces, punctuation, "
         "'&' versus 'and', and the numeric Simplex category ID."
     )
+
+
+# ============================================================
+# ACCREDITOR LOGO PICK-LISTS
+# ============================================================
+
+def accreditor_logo_selected(page, select_id, logo_id):
+    """
+    Read-only: is logo_id in the accreditor pick-list for select_id?
+
+    Simplex submits the hidden '<select_id>_sorted_list' input (comma
+    separated IDs), mirrored by <li data-cid> rows in the sortable UL
+    next to the SELECT - either one showing the ID counts.
+    """
+
+    hidden = page.locator(f"#{select_id}_sorted_list")
+
+    if hidden.count() and logo_id in hidden.first.input_value().split(","):
+        return True
+
+    return page.locator(
+        f"ul.{select_id}_sortable_list li[data-cid='{logo_id}']"
+    ).count() > 0
+
+
+def add_accreditor_logo(page, select_id, logo_id):
+    """
+    Add a logo to a Simplex accreditor pick-list (e.g. #accreditor_id).
+
+    These are listbox SELECTs whose jQuery click handler copies the
+    clicked option into the sortable UL and the hidden *_sorted_list
+    input, so the option has to be clicked - select_option() alone
+    would not register the logo.
+    """
+
+    option = page.locator(
+        f"#{select_id} option[value='{logo_id}']"
+    )
+
+    if option.count() == 0:
+        raise Exception(
+            f"Logo {logo_id} was not found in '#{select_id}'."
+        )
+
+    if accreditor_logo_selected(page, select_id, logo_id):
+        return option.first.inner_text().strip()
+
+    option.first.click()
+    page.wait_for_timeout(400)
+
+    if not accreditor_logo_selected(page, select_id, logo_id):
+
+        # Fallback: fire the click event directly on the option.
+        option.first.dispatch_event("click")
+        page.wait_for_timeout(400)
+
+    if not accreditor_logo_selected(page, select_id, logo_id):
+        raise Exception(
+            f"Logo {logo_id} could not be added to '#{select_id}'."
+        )
+
+    return option.first.inner_text().strip()
 
 
 # ============================================================
@@ -1790,6 +2085,45 @@ def fill_basic_page(
     )
 
     # --------------------------------------------------------
+    # ACCREDITATION HEADING + LOGO
+    # --------------------------------------------------------
+
+    print(
+        f"\nSetting Accreditation Heading = "
+        f"{SIMPLILEARN_NEW_LOGO_NAME}..."
+    )
+
+    accreditation_heading = page.locator(
+        "#accreditor_title"
+    )
+
+    if accreditation_heading.count() == 0:
+
+        raise Exception(
+            "Accreditation Heading field "
+            "(#accreditor_title) not found."
+        )
+
+    accreditation_heading.fill(
+        SIMPLILEARN_NEW_LOGO_NAME
+    )
+
+    print(
+        "Selecting Accreditation Logo..."
+    )
+
+    accreditation_logo = add_accreditor_logo(
+        page,
+        "accreditor_id",
+        SIMPLILEARN_NEW_LOGO_ID
+    )
+
+    print(
+        "Accreditation Logo:",
+        accreditation_logo
+    )
+
+    # --------------------------------------------------------
     # COURSE LEVEL
     # --------------------------------------------------------
 
@@ -2136,6 +2470,18 @@ def fill_basic_page(
             "Hide From Website validation failed."
         )
 
+    if accreditation_heading.input_value() != SIMPLILEARN_NEW_LOGO_NAME:
+        raise Exception(
+            "Accreditation Heading validation failed."
+        )
+
+    if not accreditor_logo_selected(
+        page, "accreditor_id", SIMPLILEARN_NEW_LOGO_ID
+    ):
+        raise Exception(
+            "Accreditation Logo validation failed."
+        )
+
     print("Course Name: PASS")
     print("Display Name: PASS")
     print("Tags: PASS")
@@ -2148,6 +2494,8 @@ def fill_basic_page(
     print("Course Level: PASS")
     print("Course Logo: PASS")
     print("Certificate: PASS")
+    print("Accreditation Heading: PASS")
+    print("Accreditation Logo: PASS")
     print("Online Self Learning: PASS")
     print("Access Days 30: PASS")
     print("Duration: PASS")
@@ -2855,11 +3203,11 @@ def fill_course_overview(
             "entered correctly."
         )
 
-    if not 250 <= actual_length <= 350:
+    if not 300 <= actual_length <= 350:
 
         raise Exception(
             "Course Overview must be "
-            "250-350 characters.\n"
+            "300-350 characters.\n"
             f"Actual: {actual_length}"
         )
 
@@ -3739,17 +4087,23 @@ def verify_b2b_skillup_saved(
             "Course Images is not set to Edit for SLH."
         )
 
-    # Accreditation must remain Same as B2C.
-    accreditation_same = select_radio_inside_section(
-        page,
-        "Accreditation Configuration",
-        "Same as B2C"
+    # Accreditation must be Edit for SLH with the Simplilearn_New logo.
+    accreditation_edit = page.locator(
+        "#slh_accreditation_source-slh"
     )
 
-    if not accreditation_same.is_checked():
+    if accreditation_edit.count() == 0 or not accreditation_edit.is_checked():
         raise Exception(
             "B2B SkillUp save verification failed: "
-            "Accreditation Configuration is not Same as B2C."
+            "Accreditation Configuration is not Edit for SLH."
+        )
+
+    if not accreditor_logo_selected(
+        page, "slh_accreditor_id", SIMPLILEARN_NEW_LOGO_ID
+    ):
+        raise Exception(
+            "B2B SkillUp save verification failed: "
+            f"Accreditation Logo {SIMPLILEARN_NEW_LOGO_NAME} is not saved."
         )
 
     print("Product offering: SAVE VERIFIED")
@@ -3762,7 +4116,8 @@ def verify_b2b_skillup_saved(
     print("Program Tag: SAVE VERIFIED - Newly Launched")
     print("Skills Validation: SAVE VERIFIED - Checked")
     print("Course Images: SAVE VERIFIED - Edit for SLH")
-    print("Accreditation Configuration: SAVE VERIFIED - Same as B2C")
+    print("Accreditation Configuration: SAVE VERIFIED - Edit for SLH")
+    print(f"Accreditation Logo: SAVE VERIFIED - {SIMPLILEARN_NEW_LOGO_NAME}")
     print("\nB2B SkillUp: SAVE VERIFIED")
 
     return page.url
@@ -4067,24 +4422,47 @@ def fill_b2b_skillup(
 
     print("Course Images - Edit for SLH: PASS")
 
-    # Verify that Accreditation Configuration was not accidentally changed.
-    print("Verifying Accreditation Configuration remains Same as B2C...")
+    # --------------------------------------------------------
+    # ACCREDITATION CONFIGURATION
+    # --------------------------------------------------------
 
-    accreditation_same = select_radio_inside_section(
-        page,
-        "Accreditation Configuration",
-        "Same as B2C"
+    print("\nSelecting Edit for SLH under Accreditation Configuration...")
+
+    # Selected by id: Course Images has its own "Edit for SLH" radio.
+    accreditation_edit = page.locator(
+        "#slh_accreditation_source-slh"
     )
 
-    # The previous helper selects the requested radio. Since Same as B2C
-    # is the required state, explicitly validate it and leave the section
-    # untouched after this verification.
-    if not accreditation_same.is_checked():
+    if accreditation_edit.count() == 0:
         raise Exception(
-            "Accreditation Configuration is not set to Same as B2C."
+            "Accreditation Configuration: Edit for SLH radio "
+            "(#slh_accreditation_source-slh) was not found."
         )
 
-    print("Accreditation Configuration: PASS - Same as B2C")
+    accreditation_edit.check()
+
+    if not accreditation_edit.is_checked():
+        raise Exception(
+            "Accreditation Configuration: Edit for SLH could not be selected."
+        )
+
+    # Simplex keeps the Logos list disabled until Edit for SLH is chosen.
+    page.wait_for_selector(
+        "#slh_accreditor_id:not([disabled])",
+        timeout=5000
+    )
+
+    print("Accreditation Configuration - Edit for SLH: PASS")
+
+    print("Selecting Accreditation Logo...")
+
+    slh_logo = add_accreditor_logo(
+        page,
+        "slh_accreditor_id",
+        SIMPLILEARN_NEW_LOGO_ID
+    )
+
+    print("Accreditation Logo: PASS -", slh_logo)
 
     print("\nAdding temporary dummy image to Program Card Thumbnail...")
     print("Adding temporary dummy image to Program Page Thumbnail...")
@@ -4180,11 +4558,20 @@ def fill_b2b_skillup(
         raise Exception("Course Images: FAIL - Edit for SLH is not selected")
     print("Course Images: PASS - Edit for SLH")
 
-    if not accreditation_same.is_checked():
+    if not accreditation_edit.is_checked():
         raise Exception(
-            "Accreditation Configuration: FAIL - Same as B2C is not selected"
+            "Accreditation Configuration: FAIL - Edit for SLH is not selected"
         )
-    print("Accreditation Configuration: PASS - Same as B2C")
+    print("Accreditation Configuration: PASS - Edit for SLH")
+
+    if not accreditor_logo_selected(
+        page, "slh_accreditor_id", SIMPLILEARN_NEW_LOGO_ID
+    ):
+        raise Exception(
+            f"Accreditation Logo: FAIL - {SIMPLILEARN_NEW_LOGO_NAME} "
+            "is not selected"
+        )
+    print(f"Accreditation Logo: PASS - {SIMPLILEARN_NEW_LOGO_NAME}")
 
     # --------------------------------------------------------
     # SUBMIT
